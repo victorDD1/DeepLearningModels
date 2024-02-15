@@ -45,7 +45,7 @@ class Downsample1d(nn.Module):
 class Upsample1d(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        self.conv = nn.ConvTranspose1d(dim, dim, 3, 2, 1)
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
 
     def forward(self, x):
         return self.conv(x)
@@ -74,8 +74,7 @@ class ConditionalResidualBlock1D(nn.Module):
             out_channels,
             cond_dim,
             kernel_size=3,
-            n_groups=8,
-            ):
+            n_groups=8):
         super().__init__()
 
         self.blocks = nn.ModuleList([
@@ -242,7 +241,74 @@ class ConditionalUnet1DBase(nn.Module):
         # (B,C,T)
         x = x.moveaxis(-1,-2)
         return x
+
+DEFAULT_NUM_HEADS = 1
+
+class AttentionConditionalUnet1DBase(ConditionalUnet1DBase):
+    def __init__(self,
+        input_dim,
+        embedding_dim,
+        diffusion_step_embed_dim=256,
+        down_dims=[256,512,1024],
+        kernel_size=5,
+        n_groups=8,
+        exclude_first:int=0,
+        **kwargs,
+        ):
+        self.input_dim = input_dim
+        self.exclude_first = exclude_first
+
+        self.args_optional = {
+            "num_heads" : DEFAULT_NUM_HEADS,
+        }
+        self.args_optional.update(kwargs)
+        for k, v in self.args_optional.items(): setattr(self, k, v)
+
+        super().__init__(input_dim,
+                        input_dim * exclude_first,
+                        diffusion_step_embed_dim,
+                        down_dims,
+                        kernel_size,
+                        n_groups)
+
+        self.attention = nn.MultiheadAttention(input_dim,
+                                               self.num_heads,
+                                               batch_first=True,
+                                               kdim=embedding_dim,
+                                               vdim=embedding_dim,
+                                               )
+        
+        self.embedding = nn.Linear(input_dim, embedding_dim)
+        self.norm = nn.BatchNorm1d(self.exclude_first)
+        self.flatten = nn.Flatten()
+        self.softmax = nn.Softmax(-1)
     
+
+    def forward(self,
+                noisy_data_samples: torch.Tensor,
+                timestep: torch.Tensor=None,
+                global_cond=None):
+        """
+        noisy_data_samples: (B,T,input_dim)
+        timestep: (B,) or int, diffusion step
+        global_cond: (B,global_cond_dim)
+        output: (B,T,input_dim)
+        """
+        if global_cond != None:
+            B = noisy_data_samples.shape[0]
+            global_cond = global_cond.reshape(B, -1, self.input_dim) # [B, T, C]
+
+            if self.exclude_first > 0:
+                query = global_cond[:, :self.exclude_first, :]
+                out, att = self.attention(query,
+                                          self.embedding(global_cond[:, self.exclude_first:, :]),
+                                          self.embedding(global_cond[:, self.exclude_first:, :])) # [B, exclude_first, E], [B, exclude_first, T - exclude_first]
+                self.att_prob = self.softmax(att)
+                #max_prob, _ = torch.max(self.att_prob, axis=-1)
+                #print(max_prob)
+                global_cond = self.flatten(self.norm(out + query))
+        
+        return super().forward(noisy_data_samples, timestep, global_cond)
 
 class ConditionalUnet1D(DDPM):
     def __init__(self,
@@ -260,6 +326,28 @@ class ConditionalUnet1D(DDPM):
             diffusion_step_embed_dim,
             down_dims,
             kernel_size,
-            n_groups
+            n_groups,
+            **kwargs
+        )
+        super().__init__(model, **kwargs)
+
+class AttentionConditionalUnet1D(DDPM):
+    def __init__(self,
+        input_dim,
+        embedding_dim,
+        diffusion_step_embed_dim=256,
+        down_dims=[256,512,1024],
+        kernel_size=5,
+        n_groups=8,
+        **kwargs) -> None:
+
+        model = AttentionConditionalUnet1DBase(
+            input_dim,
+            embedding_dim,
+            diffusion_step_embed_dim,
+            down_dims,
+            kernel_size,
+            n_groups,
+            **kwargs
         )
         super().__init__(model, **kwargs)
